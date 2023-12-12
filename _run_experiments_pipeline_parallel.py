@@ -20,7 +20,7 @@ from model import GPTConfig, GPT
 out_dir = 'out'
 eval_interval = 5
 log_interval = 1
-eval_iters = 10
+eval_iters = 1
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'gpt2-medium'#'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -29,10 +29,10 @@ wandb_log = False # disabled by default
 wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'shakespeare'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 8 #2 #11 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_split_size = 4
+dataset = 'wikitext' #'shakespeare'
+gradient_accumulation_steps = 2 #5 * 8 # used to simulate larger batch sizes
+batch_size = 4 #2 #11 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_split_size = 1
 block_size = 1024
 # model
 n_layer = 12
@@ -42,7 +42,7 @@ dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 5 # total number of training iterations
+max_iters = 5 #5 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -128,6 +128,7 @@ def init_model():
         # init a new model from scratch
         if master_process:
             print(f"Initializing a new model from scratch : block_size {block_size}, batch_size {batch_size}")
+            print(f"Batch size {batch_size} gradient acc steps {gradient_accumulation_steps} batch split size {batch_split_size}")
             # determine the vocab size we'll use for from-scratch training
             print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
         model_args['vocab_size'] = 50304
@@ -136,6 +137,7 @@ def init_model():
     elif init_from.startswith('gpt2'):
         if master_process:
             print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+            print(f"Batch size {batch_size} gradient acc steps {gradient_accumulation_steps} batch split size {batch_split_size}")
         # initialize from OpenAI GPT-2 weights
         override_args = dict(dropout=dropout)
         model = GPT.from_pretrained(init_from, override_args)
@@ -176,9 +178,10 @@ model, model_args, optimizer, scaler = init_model()
 # partition layers across GPUs
 num_gpus = torch.cuda.device_count()
 layers_to_partition = model.transformer.h # 12 blocks of Self Attention + MLP
-partition_sizes = [len(layers_to_partition) // num_gpus] * num_gpus
-for i in range(len(layers_to_partition) % num_gpus):
-    partition_sizes[i] += 1
+partition_sizes = [7, 5]
+# partition_sizes = [len(layers_to_partition) // num_gpus] * num_gpus
+# for i in range(len(layers_to_partition) % num_gpus):
+#     partition_sizes[i] += 1
 
 partitions = []
 start = 0
@@ -207,9 +210,10 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            #X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                #logits, loss = model(X, Y)
+                loss = train_step(data_split=split, to_train=False)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -235,24 +239,25 @@ def sizeof_fmt(num, suffix="B"):
             return f"{num:3.2f}{unit}B"
         num /= 1024.0
 
-def train_step(iter_num, to_train=True):
+def train_step(iter_num=0, data_split='train', to_train=True):
     # determine and set the learning rate for this iteration
     if to_train:
         lr = get_lr(iter_num) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr      
-        
+
+    # X, Y = get_batch(data_split)         
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        if ddp and actual_ddp:
+        if ddp: # and actual_ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            X, Y = get_batch('train') 
+            X, Y = get_batch(data_split) 
             X_splits = iter(X.split(batch_size//batch_split_size, dim=0))                    
             Y_splits = iter(Y.split(batch_size//batch_split_size, dim=0))
             for X_split in X_splits:
@@ -261,7 +266,7 @@ def train_step(iter_num, to_train=True):
                     X_split = partitions[0](X_split)
                     broadcast(X_split, src=0)
             
-                if ddp_rank == 1:
+                if ddp_rank == num_gpus-1:
                     X_split = torch.zeros((batch_size//batch_split_size, model_args['block_size'], model_args['n_embd'])).to('cuda:1')
                     broadcast(X_split, src=0)
                     
@@ -271,25 +276,27 @@ def train_step(iter_num, to_train=True):
                     
                     Y_split = next(Y_splits)
                     loss = F.cross_entropy(X_split.view(-1, X_split.size(-1)), Y_split.view(-1).to(f'cuda:1'), ignore_index=-1)
-                    loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+                    print(f"Iteration {iter_num} microstep {micro_step} train loss {loss} for batch of actually {len(X_split)}")
+                    loss = loss / (batch_split_size*gradient_accumulation_steps) # scale the loss to account for gradient accumulation
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         # X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        if ddp_rank == 1:
+        if ddp_rank == num_gpus-1 and to_train:
             scaler.scale(loss).backward()
-    # clip the gradient
-    if ddp_rank == 1:
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
-        scaler.update()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
+    if ddp_rank == num_gpus-1:
+        if to_train:
+            # clip the gradient
+            if grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # step the optimizer and scaler if training in fp16
+            scaler.step(optimizer)
+            scaler.update()
+            # flush the gradients as soon as we can, no need for this memory anymore
+            optimizer.zero_grad(set_to_none=True)
     else:
-        loss = None # dummy value to return for other threads
+        loss = torch.Tensor([0]) # dummy value to return for other threads
     
     return loss
 
@@ -307,21 +314,24 @@ with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
         
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 and master_process:
+            t0_step = time.time()
             losses = estimate_loss()
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            t1_step = time.time()
+            #if ddp_rank == num_gpus-1:
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, time {(t1_step - t0_step)*1000:.2f}ms")
         if iter_num == 0 and eval_only:
             break
 
-        loss = train_step(iter_num)
+        loss = train_step(iter_num=iter_num)
 
         # timing and logging
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0 and ddp_rank == 1:
+        if iter_num % log_interval == 0 and ddp_rank == num_gpus-1:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-            lossf = loss.item() * gradient_accumulation_steps
+            lossf = loss.item() * (batch_split_size*gradient_accumulation_steps)
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
         iter_num += 1
 
@@ -339,8 +349,22 @@ if master_process:
         t1 = json.load(f)
     del t0['distributedInfo']
     t0['traceEvents'].extend(t1['traceEvents'])
+    new_traceEvents = []
+    for t in t0['traceEvents']:
+        if t['tid'] == 7:
+            t['tid'] = t['pid']
+            t['pid'] = 0
+            new_traceEvents.append(t)
+    t0['traceEvents'] = new_traceEvents
     with open('combined_trace.json', 'w+') as f:
         json.dump(t0, f)
+
+# s = [t for t in t['traceEvents'] if t['tid'] == 7]
+# for si in s:
+#     si['tid'] = si['pid']
+#     si['pid'] = 0
+
+# t['traceEvents'] = s
 
 print("Peak memory usage for GPUs: ", end="")
 for i in range(num_gpus):
@@ -367,21 +391,21 @@ def measure_training_throughput(batch_size, block_size=128, start_iter=20, max_i
     for iter_num in range(max_iters + 1):
         if iter_num == start_iter:
             t0 = time.time()
-        loss = train_step(iter_num)
-        if iter_num % 5 == 0:
+        loss = train_step(iter_num=iter_num)
+        if iter_num % 5 == 0 and ddp_rank == num_gpus-1:
             print(f'Iteration {iter_num}: loss {loss}')
         
         
     training_total_seconds = time.time() - t0
     tokens_per_iter = ddp_world_size * batch_size * block_size
-    training_tokens_per_second = tokens_per_iter / training_total_seconds
+    training_tokens_per_second = tokens_per_iter * (max_iters - start_iter) / training_total_seconds
     print(f"Training throughput, batch size {batch_size}: {training_tokens_per_second:.4f} tokens/second")
     
 if master_process:
     print("\nMeasuring training throughput\n")
 batch_size = 4
 measure_training_throughput(batch_size)
-batch_size = 6
+batch_size = 12
 measure_training_throughput(batch_size)
 
 if ddp:
