@@ -3,8 +3,8 @@ Evaluate next-token-prediction perplexity of pre-trained model
 """
 
 import gc
-from model import GPTConfig, GPT
-from model_quantized import GPT_QConfig, GPT_Q
+from model_speculative import GPT
+from model_quantized import GPT_Q
 from contextlib import nullcontext
 import numpy as np
 import os

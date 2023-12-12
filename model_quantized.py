@@ -63,7 +63,6 @@ class LayerNorm_Q(nn.Module):
     def forward(self, input):
         if self.quantized:
             assert self.weight.dtype == torch.int8; assert self.bias.dtype == torch.int8
-            # quantized_weight = self.weight.data
             self.weight.data = dequantize_tensor(self.weight, *self.quantization_parameters['weight'])
             self.bias.data = dequantize_tensor(self.bias, *self.quantization_parameters['bias'])
             output = F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
@@ -85,6 +84,7 @@ class LayerNorm_Q(nn.Module):
             param_q = quantize_tensor(param.data, s, z, self.alpha_q, self.beta_q)
             param.requires_grad = False
             param.data = param_q
+            assert (param.data == quantize_tensor(dequantize_tensor(param.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
         
         self.quantized = True
 
@@ -164,6 +164,7 @@ class CausalSelfAttention_Q(nn.Module):
             param_q = quantize_tensor(param.data, s, z, self.alpha_q, self.beta_q)
             param.requires_grad = False
             param.data = param_q
+            assert (param.data == quantize_tensor(dequantize_tensor(param.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
 
 class MLP_Q(nn.Module):
 
@@ -211,6 +212,7 @@ class MLP_Q(nn.Module):
             param_q = quantize_tensor(param.data, s, z, self.alpha_q, self.beta_q)
             param.requires_grad = False
             param.data = param_q
+            assert (param.data == quantize_tensor(dequantize_tensor(param.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
 
 class Block_Q(nn.Module):
 
@@ -481,6 +483,7 @@ class GPT_Q(nn.Module):
         param_q = quantize_tensor(self.transformer.wte.weight.data, s, z, self.alpha_q, self.beta_q)
         self.transformer.wte.weight.requires_grad = False
         self.transformer.wte.weight.data = param_q
+        assert (self.transformer.wte.weight.data == quantize_tensor(dequantize_tensor(self.transformer.wte.weight.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
 
         # Quantize position embeddings
         alpha, beta = get_symmetric_range(self.transformer.wpe.weight.data)
@@ -489,6 +492,7 @@ class GPT_Q(nn.Module):
         param_q = quantize_tensor(self.transformer.wpe.weight.data, s, z, self.alpha_q, self.beta_q)
         self.transformer.wpe.weight.requires_grad = False
         self.transformer.wpe.weight.data = param_q
+        assert (self.transformer.wpe.weight.data == quantize_tensor(dequantize_tensor(self.transformer.wpe.weight.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
         
         # Quantize CausalSelfAttention, MLP layers
         for i in range(len(self.transformer.h)):
