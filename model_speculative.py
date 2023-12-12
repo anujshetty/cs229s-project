@@ -7,15 +7,6 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-"""
-Done:
-- Linear quantized token embeddings (symmetric)
-- Linear quantized position embeddings (symmetric)
-- Linear quantized MLP weights (symmetric) and biases (affine)
-- Linear quantized Attention projection weights (symmetric) + biases (affine)
-- Linear quantized LayerNorm weights (affine) and biases (affine)
-"""
-
 import math
 import inspect
 from dataclasses import dataclass
@@ -24,33 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# https://leimao.github.io/article/Neural-Networks-Quantization/
-def quantize_tensor(x, s, z, alpha_q, beta_q):
-    x_q = torch.round((x / s) + z, decimals=0)
-    x_q = torch.clamp(x_q, min=alpha_q, max=beta_q)
-    x_q = x_q.to(torch.int8)
-    return x_q
-
-def dequantize_tensor(x_q, s, z):
-    x_q = x_q.to(torch.int32)
-    x = s * (x_q - z)
-    x = x.to(torch.float32)
-    return x
-
-def get_tensor_quantization_parameters(alpha, beta, alpha_q, beta_q):
-    s = (beta - alpha) / (beta_q - alpha_q)
-    z = int((beta * alpha_q - alpha * beta_q) / (beta - alpha))
-    return s, z
-
-# https://pytorch.org/blog/quantization-in-practice/
-def get_symmetric_range(x):
-    beta = torch.max(x.max(), x.min().abs())
-    return -beta.item(), beta.item()
-
-def get_affine_range(x):
-    return x.min().item(), x.max().item()
-
-class LayerNorm_Q(nn.Module):
+class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
     def __init__(self, ndim, bias):
@@ -58,37 +23,10 @@ class LayerNorm_Q(nn.Module):
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-        self.quantized = False
-
     def forward(self, input):
-        if self.quantized:
-            assert self.weight.dtype == torch.int8; assert self.bias.dtype == torch.int8
-            self.weight.data = dequantize_tensor(self.weight, *self.quantization_parameters['weight'])
-            self.bias.data = dequantize_tensor(self.bias, *self.quantization_parameters['bias'])
-            output = F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-            self.weight.data = quantize_tensor(self.weight, *self.quantization_parameters['weight'], self.alpha_q, self.beta_q)
-            self.bias.data = quantize_tensor(self.bias, *self.quantization_parameters['bias'], self.alpha_q, self.beta_q)
-            assert self.weight.dtype == torch.int8; assert self.bias.dtype == torch.int8
-            return output
-        else:
-            return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-    
-    def quantize_all_parameters(self):
-        self.alpha_q, self.beta_q = -128, 127
-        self.quantization_parameters = {}
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-        for name, param in self.named_parameters():
-            alpha, beta = get_affine_range(param.data)
-            s, z = get_tensor_quantization_parameters(alpha, beta, self.alpha_q, self.beta_q)
-            self.quantization_parameters[name] = (s, z)
-            param_q = quantize_tensor(param.data, s, z, self.alpha_q, self.beta_q)
-            param.requires_grad = False
-            param.data = param_q
-            assert (param.data == quantize_tensor(dequantize_tensor(param.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
-        
-        self.quantized = True
-
-class CausalSelfAttention_Q(nn.Module):
+class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -115,14 +53,7 @@ class CausalSelfAttention_Q(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        assert self.c_attn.weight.dtype == torch.int8; assert self.c_attn.bias.dtype == torch.int8
-        self.c_attn.weight.data = dequantize_tensor(self.c_attn.weight, *self.quantization_parameters['c_attn.weight'])
-        self.c_attn.bias.data = dequantize_tensor(self.c_attn.bias, *self.quantization_parameters['c_attn.bias'])
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        self.c_attn.weight.data = quantize_tensor(self.c_attn.weight, *self.quantization_parameters['c_attn.weight'], self.alpha_q, self.beta_q)
-        self.c_attn.bias.data = quantize_tensor(self.c_attn.bias, *self.quantization_parameters['c_attn.bias'], self.alpha_q, self.beta_q)
-        assert self.c_attn.weight.dtype == torch.int8; assert self.c_attn.bias.dtype == torch.int8
-
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -141,32 +72,10 @@ class CausalSelfAttention_Q(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        assert self.c_proj.weight.dtype == torch.int8; assert self.c_proj.bias.dtype == torch.int8
-        self.c_proj.weight.data = dequantize_tensor(self.c_proj.weight, *self.quantization_parameters['c_proj.weight'])
-        self.c_proj.bias.data = dequantize_tensor(self.c_proj.bias, *self.quantization_parameters['c_proj.bias'])
         y = self.resid_dropout(self.c_proj(y))
-        self.c_proj.weight.data = quantize_tensor(self.c_proj.weight, *self.quantization_parameters['c_proj.weight'], self.alpha_q, self.beta_q)
-        self.c_proj.bias.data = quantize_tensor(self.c_proj.bias, *self.quantization_parameters['c_proj.bias'], self.alpha_q, self.beta_q)
-        assert self.c_proj.weight.dtype == torch.int8; assert self.c_proj.bias.dtype == torch.int8
         return y
-    
-    def quantize_all_parameters(self):
-        self.alpha_q, self.beta_q = -128, 127
-        self.quantization_parameters = {}
 
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                alpha, beta = get_symmetric_range(param.data)
-            elif 'bias' in name:
-                alpha, beta = get_affine_range(param.data)
-            s, z = get_tensor_quantization_parameters(alpha, beta, self.alpha_q, self.beta_q)
-            self.quantization_parameters[name] = (s, z)
-            param_q = quantize_tensor(param.data, s, z, self.alpha_q, self.beta_q)
-            param.requires_grad = False
-            param.data = param_q
-            assert (param.data == quantize_tensor(dequantize_tensor(param.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
-
-class MLP_Q(nn.Module):
+class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -176,52 +85,20 @@ class MLP_Q(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        assert self.c_fc.weight.dtype == torch.int8; assert self.c_fc.bias.dtype == torch.int8
-        self.c_fc.weight.data = dequantize_tensor(self.c_fc.weight, *self.quantization_parameters['c_fc.weight'])
-        self.c_fc.bias.data = dequantize_tensor(self.c_fc.bias, *self.quantization_parameters['c_fc.bias'])
         x = self.c_fc(x)
-        self.c_fc.weight.data = quantize_tensor(self.c_fc.weight, *self.quantization_parameters['c_fc.weight'], self.alpha_q, self.beta_q)
-        self.c_fc.bias.data = quantize_tensor(self.c_fc.bias, *self.quantization_parameters['c_fc.bias'], self.alpha_q, self.beta_q)
-        assert self.c_fc.weight.dtype == torch.int8; assert self.c_fc.bias.dtype == torch.int8
-        
         x = self.gelu(x)
-        
-        assert self.c_proj.weight.dtype == torch.int8; assert self.c_proj.bias.dtype == torch.int8
-        self.c_proj.weight.data = dequantize_tensor(self.c_proj.weight, *self.quantization_parameters['c_proj.weight'])
-        self.c_proj.bias.data = dequantize_tensor(self.c_proj.bias, *self.quantization_parameters['c_proj.bias'])
         x = self.c_proj(x)
-        self.c_proj.weight.data = quantize_tensor(self.c_proj.weight, *self.quantization_parameters['c_proj.weight'], self.alpha_q, self.beta_q)
-        self.c_proj.bias.data = quantize_tensor(self.c_proj.bias, *self.quantization_parameters['c_proj.bias'], self.alpha_q, self.beta_q)
-        assert self.c_proj.weight.dtype == torch.int8; assert self.c_proj.bias.dtype == torch.int8
-        
         x = self.dropout(x)
-        
         return x
-    
-    def quantize_all_parameters(self):
-        self.alpha_q, self.beta_q = -128, 127
-        self.quantization_parameters = {}
 
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                alpha, beta = get_symmetric_range(param.data)
-            elif 'bias' in name:
-                alpha, beta = get_affine_range(param.data)
-            s, z = get_tensor_quantization_parameters(alpha, beta, self.alpha_q, self.beta_q)
-            self.quantization_parameters[name] = (s, z)
-            param_q = quantize_tensor(param.data, s, z, self.alpha_q, self.beta_q)
-            param.requires_grad = False
-            param.data = param_q
-            assert (param.data == quantize_tensor(dequantize_tensor(param.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
-
-class Block_Q(nn.Module):
+class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm_Q(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention_Q(config)
-        self.ln_2 = LayerNorm_Q(config.n_embd, bias=config.bias)
-        self.mlp = MLP_Q(config)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -229,7 +106,7 @@ class Block_Q(nn.Module):
         return x
 
 @dataclass
-class GPT_QConfig:
+class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -238,7 +115,7 @@ class GPT_QConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-class GPT_Q(nn.Module):
+class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -250,8 +127,8 @@ class GPT_Q(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block_Q(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm_Q(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -297,18 +174,8 @@ class GPT_Q(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        assert self.transformer.wte.weight.dtype == torch.int8
-        self.transformer.wte.weight.data = dequantize_tensor(self.transformer.wte.weight.data, *self.quantization_parameters['transformer.wte.weight'])
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        self.transformer.wte.weight.data = quantize_tensor(self.transformer.wte.weight.data, *self.quantization_parameters['transformer.wte.weight'], self.alpha_q, self.beta_q)
-        assert self.transformer.wte.weight.dtype == torch.int8
-
-        assert self.transformer.wpe.weight.dtype == torch.int8
-        self.transformer.wpe.weight.data = dequantize_tensor(self.transformer.wpe.weight.data, *self.quantization_parameters['transformer.wpe.weight'])
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        self.transformer.wpe.weight.data = quantize_tensor(self.transformer.wpe.weight.data, *self.quantization_parameters['transformer.wpe.weight'], self.alpha_q, self.beta_q)
-        assert self.transformer.wpe.weight.dtype == torch.int8
-
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -316,21 +183,10 @@ class GPT_Q(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            assert self.lm_head.weight.dtype == torch.int8
-            self.lm_head.weight.data = dequantize_tensor(self.lm_head.weight.data, *self.quantization_parameters['transformer.wte.weight'])
             logits = self.lm_head(x)
-            self.lm_head.weight.data = quantize_tensor(self.lm_head.weight.data, *self.quantization_parameters['transformer.wte.weight'], self.alpha_q, self.beta_q)
-            assert self.lm_head.weight.dtype == torch.int8
-
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            assert self.lm_head.weight.dtype == torch.int8
-            self.lm_head.weight.data = dequantize_tensor(self.lm_head.weight.data, *self.quantization_parameters['transformer.wte.weight'])
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            self.lm_head.weight.data = quantize_tensor(self.lm_head.weight.data, *self.quantization_parameters['transformer.wte.weight'], self.alpha_q, self.beta_q)
-            assert self.lm_head.weight.dtype == torch.int8
-
+            logits = self.lm_head(x)
             loss = None
 
         return logits, loss
@@ -371,8 +227,8 @@ class GPT_Q(nn.Module):
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
-        config = GPT_QConfig(**config_args)
-        model = GPT_Q(config)
+        config = GPTConfig(**config_args)
+        model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
@@ -461,6 +317,9 @@ class GPT_Q(nn.Module):
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
+                if top_k == 1:
+                    idx = torch.cat((idx, torch.argmax(logits, dim=-1).reshape((-1,1))), dim=1) # using argmax here preserves RNG state
+                    continue
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
@@ -472,36 +331,65 @@ class GPT_Q(nn.Module):
 
         return idx
 
-    def quantize_all_parameters(self, quantize_ln=True):
-        self.alpha_q, self.beta_q = -128, 127
-        self.quantization_parameters = {}
+    @torch.no_grad()
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=3):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
 
-        # Quantize token embeddings
-        alpha, beta = get_symmetric_range(self.transformer.wte.weight.data)
-        s, z = get_tensor_quantization_parameters(alpha, beta, self.alpha_q, self.beta_q)
-        self.quantization_parameters['transformer.wte.weight'] = (s, z)
-        param_q = quantize_tensor(self.transformer.wte.weight.data, s, z, self.alpha_q, self.beta_q)
-        self.transformer.wte.weight.requires_grad = False
-        self.transformer.wte.weight.data = param_q
-        assert (self.transformer.wte.weight.data == quantize_tensor(dequantize_tensor(self.transformer.wte.weight.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
-
-        # Quantize position embeddings
-        alpha, beta = get_symmetric_range(self.transformer.wpe.weight.data)
-        s, z = get_tensor_quantization_parameters(alpha, beta, self.alpha_q, self.beta_q)
-        self.quantization_parameters['transformer.wpe.weight'] = (s, z)
-        param_q = quantize_tensor(self.transformer.wpe.weight.data, s, z, self.alpha_q, self.beta_q)
-        self.transformer.wpe.weight.requires_grad = False
-        self.transformer.wpe.weight.data = param_q
-        assert (self.transformer.wpe.weight.data == quantize_tensor(dequantize_tensor(self.transformer.wpe.weight.data, s, z), s, z, self.alpha_q, self.beta_q)).all().item()
+        # note: making speculative decoding work with batch_size>1 is beyond this assignment's scope, because the
+        # tensors rapidly become ragged. So, you can assume that batch_size=1 for this part.
+        if idx.size(0) != 1:
+            raise ValueError("speculative decoding only works with batch size 1")
+        idx_length_original = idx.size(1)
         
-        # Quantize CausalSelfAttention, MLP layers
-        for i in range(len(self.transformer.h)):
-            self.transformer.h[i].attn.quantize_all_parameters()
-            self.transformer.h[i].mlp.quantize_all_parameters()
+        loop_counter = 0
+        while idx.size(1) < idx_length_original + max_new_tokens:
+            loop_counter += 1
 
-        # Quantize LayerNorms?
-        if quantize_ln:
-            for i in range(len(self.transformer.h)):
-                self.transformer.h[i].ln_1.quantize_all_parameters()
-                self.transformer.h[i].ln_2.quantize_all_parameters()
-            self.transformer.ln_f.quantize_all_parameters()
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size-num_speculative else idx[:, -(self.config.block_size-num_speculative):]
+
+            # Generate speculative tokens from the draft model. Then, run it through the main model.
+            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+
+            # use the draft_model to generate speculative tokens
+            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1)
+            # obtain the logits from the main model by passing in the idx_speculative
+            all_logits, _ = self(idx_speculative)
+
+            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+
+            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+            all_accepted = True
+            for k in range(num_speculative):
+                # pluck the logits at the current position and scale by desired temperature
+                logits = all_logits[:, idx_cond.size(1) + k - 1, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+                # sample from the distribution with temperature
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
+                # end the loop if the next token does not match the next token in idx_speculative
+                if idx_next.item() != idx_speculative[:, idx_cond.size(1) + k].item():
+                    all_accepted = False
+                    break
+
+            if all_accepted:
+                logits = all_logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+                
+        print(f"Ran for {loop_counter} iterations generated {max_new_tokens} tokens with num_speculative={num_speculative}")
+        return idx[:, :idx_length_original+max_new_tokens]
