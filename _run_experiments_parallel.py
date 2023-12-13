@@ -23,7 +23,7 @@ log_interval = 1
 eval_iters = 1
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = False # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
@@ -126,12 +126,26 @@ def init_model():
         # init a new model from scratch
         if master_process:
             print(f"Initializing a new model from scratch : block_size {block_size}, batch_size {batch_size}")
+            print(f"Batch size {batch_size} gradient acc steps {gradient_accumulation_steps} batch split size {batch_split_size}")
             # determine the vocab size we'll use for from-scratch training
             print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
         model_args['vocab_size'] = 50304
         gptconf = GPTConfig(**model_args)
         model = GPT(gptconf)
+    elif init_from.startswith('gpt2'):
+        if master_process:
+            print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+            print(f"Batch size {batch_size} gradient acc steps {gradient_accumulation_steps} batch split size {batch_split_size}")
+        # initialize from OpenAI GPT-2 weights
+        override_args = dict(dropout=dropout)
+        model = GPT.from_pretrained(init_from, override_args)
+        # read off the created config params, so we can store them into checkpoint correctly
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = getattr(model.config, k)
     # removed 'resume' and 'gpt2' options
+
+    if master_process:
+        print(model.config)
 
     # crop down the model block size if desired, using model surgery
     if block_size < model.config.block_size:
@@ -308,8 +322,8 @@ with profile(activities=[torch.profiler.ProfilerActivity.CUDA],
                 # X_prev = model.lm_head(X_prev.to(f'cuda:0'))
                 # loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1), ignore_index=-1)
                 
-                X_prev = model.lm_head.to(f'cuda:1')(X_prev)                
-                loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1).to(f'cuda:1'), ignore_index=-1)
+                X_prev = model.lm_head(X_prev.to(f'cuda:0'))                
+                loss = F.cross_entropy(X_prev.view(-1, X_prev.size(-1)), next(Y_splits).view(-1), ignore_index=-1)
                 
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
