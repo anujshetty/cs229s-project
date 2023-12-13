@@ -219,3 +219,44 @@ del M
 del D
 gc.collect()
 torch.cuda.empty_cache()
+
+# ------------------------------------------------------------------------------
+# Deliverables 3 and 4
+# ------------------------------------------------------------------------------
+print("-" * 80 + "\nLeaderboard: memory usage for inference without quantization \n" + "-" * 80)
+# Load pre-trained model
+model_pt = GPT.from_pretrained(init_from, dict(dropout=0.0))
+model_pt.eval()
+torch.cuda.reset_peak_memory_stats(device=device)
+model_pt.to(device)
+print(f"\nGPU memory allocated after calling model.to(device) {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+if compile:
+    model_pt = torch.compile(model_pt) # requires PyTorch 2.0 (optional)
+# Run evaluation
+torch.cuda.reset_peak_memory_stats(device=device)
+ppl_pt_bs4 = measure_perplexity(model_pt, val_data, batch_size=1)
+print(f"GPT-2 perplexity on {dataset}/val.bin, batch_size={1}: {ppl_pt_bs4:.4f}")
+print(f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+del model_pt
+gc.collect()
+torch.cuda.empty_cache()
+print("\n")
+
+print("-" * 80 + "\nLeaderboard: memory usage for inference with quantization\n" + "-" * 80)
+# Load pre-trained model and quantize
+model_dq = GPT_Q.from_pretrained(init_from, dict(dropout=0.0))
+model_dq.quantize_all_parameters()
+torch.cuda.reset_peak_memory_stats(device=device)
+model_dq.to(device)
+print(f"\nGPU memory allocated after calling model.to(device) {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+if compile:
+    model_dq = torch.compile(model_dq) # requires PyTorch 2.0 (optional)
+# Run evaluation
+torch.cuda.reset_peak_memory_stats(device=device)
+ppl_dq_bs4 = measure_perplexity(model_dq, val_data, batch_size=1)
+print(f"GPT-2 quantized perplexity on {dataset}/val.bin, batch_size={1}: {ppl_dq_bs4:.4f}")
+print(f"Peak GPU memory allocated: {torch.cuda.max_memory_allocated(device=device) / 1024 ** 3:.4f} GB")
+print()
+del model_dq
+gc.collect()
+torch.cuda.empty_cache()
