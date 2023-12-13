@@ -3,5 +3,6 @@
     "inference_latency_1": 178.9039,
     "inference_latency_12": 351.4810, 
     "training_throughput_4": 221.3719,
-    "training_throughput_12": 418.4762 
+    "training_throughput_12": 418.4762,
+    "memory_usage": 725769182
 }
