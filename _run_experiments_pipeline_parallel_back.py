@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F 
 from torch.profiler import profile, record_function
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group, broadcast, barrier
+from torch.distributed import init_process_group, destroy_process_group, broadcast, barrier, send, recv
 
 from model import GPTConfig, GPT
 
@@ -32,7 +32,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'wikitext' #'shakespeare'
 gradient_accumulation_steps = 2 #5 * 8 # used to simulate larger batch sizes
 batch_size = 4 #2 #11 # if gradient_accumulation_steps > 1, this is the micro-batch size
-batch_split_size = 2
+batch_split_size = 4
 block_size = 1024
 # model
 n_layer = 12
@@ -42,7 +42,7 @@ dropout = 0.1 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 5 # total number of training iterations
+max_iters = 1 #5 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -179,7 +179,7 @@ model, model_args, optimizer, scaler = init_model(block_size=block_size)
 num_gpus = torch.cuda.device_count()
 layers_to_partition = model.transformer.h # 12 blocks of Self Attention + MLP
 # partition_sizes =  [7, 5]
-partition_sizes =  [18, 6]
+partition_sizes =  [16, 8]
 assert sum(partition_sizes) == len(layers_to_partition)
 # partition_sizes = [len(layers_to_partition) // num_gpus] * num_gpus
 # for i in range(len(layers_to_partition) % num_gpus):
@@ -248,11 +248,20 @@ def train_step(iter_num=0, data_split='train', to_train=True):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr      
 
+    params_0 = list(partitions[0].parameters()) + \
+                list(model.transformer.wte.parameters()) + \
+                list(model.transformer.wpe.parameters()) + \
+                list(model.transformer.drop.parameters())
+    
+    params_1 = list(model.lm_head.parameters()) + \
+                list(model.transformer.ln_f.parameters()) + \
+                list(partitions[1].parameters()) 
+
     # X, Y = get_batch(data_split)         
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        if ddp: # and actual_ddp:
+        if ddp and actual_ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
             # I really dislike that this bloats the code and forces us to repeat code
@@ -262,43 +271,59 @@ def train_step(iter_num=0, data_split='train', to_train=True):
             X, Y = get_batch(data_split) 
             X_splits = iter(X.split(batch_split_size, dim=0))                    
             Y_splits = iter(Y.split(batch_split_size, dim=0))
-            for X_split in X_splits:
+            # if ddp_rank == 0:
+            #     X_prev = get_embedding(model, next(X_splits))
+            #     X_prev = partitions[0](X_prev)
+            #     broadcast(X_prev, src=0)
+
+            for X_next in X_splits:
                 if ddp_rank == 0:
-                    X_split = get_embedding(model, X_split)
-                    X_split = partitions[0](X_split)
-                    broadcast(X_split, src=0)
+                    X_next = get_embedding(model, X_next)
+                    X_next = partitions[0](X_next)
+                    broadcast(X_next, src=0)
             
                 if ddp_rank == num_gpus-1:
-                    X_split = torch.zeros((batch_split_size, model_args['block_size'], model_args['n_embd'])).to('cuda:1')
-                    broadcast(X_split, src=0)
+                    X_prev_intermediate = torch.zeros((batch_split_size, model_args['block_size'], model_args['n_embd'])).to('cuda:1')
+                    broadcast(X_prev_intermediate, src=0)
                     
-                    X_split = partitions[1].to('cuda:1')(X_split)                    
+                    X_split = partitions[1].to('cuda:1')(X_prev_intermediate)
                     X_split = model.transformer.ln_f.to(f'cuda:1')(X_split)
                     X_split = model.lm_head.to(f'cuda:1')(X_split)
                     
                     Y_split = next(Y_splits)
                     loss = F.cross_entropy(X_split.view(-1, X_split.size(-1)), Y_split.view(-1).to(f'cuda:1'), ignore_index=-1)
                     loss = loss / (gradient_accumulation_steps*batch_size//batch_split_size) # scale the loss to account for gradient accumulation
+                    
+                    loss.backward()
+                    broadcast(X_prev_intermediate.grad, src=1)
+                    for param in params_1:
+                        broadcast(param.grad, src=1)
+                
+                if ddp_rank == 0:
+                    for param in params_1:
+                        broadcast(param.grad, src=1)
+                    broadcast(X_next.grad, src=1)
+                    X_next.backward(X_next.grad)
 
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        # X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        if ddp_rank == num_gpus-1 and to_train:
-            scaler.scale(loss).backward()
-    if ddp_rank == num_gpus-1:
-        if to_train:
-            # clip the gradient
-            if grad_clip != 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            # step the optimizer and scaler if training in fp16
-            scaler.step(optimizer)
-            scaler.update()
-            # flush the gradients as soon as we can, no need for this memory anymore
-            optimizer.zero_grad(set_to_none=True)
-    else:
-        loss = torch.Tensor([0]) # dummy value to return for other threads
-    
+                    for param in params_0:
+                        broadcast(param.grad, src=0)
+                
+                if ddp_rank == 1:
+                    for param in params_0:
+                        broadcast(param.grad, src=0)
+                    loss = torch.Tensor([0]) # dummy value to return for other threads
+                
+                if to_train:
+                    # clip the gradient
+                    if grad_clip != 0.0:
+                        # scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    # # step the optimizer and scaler if training in fp16
+                    # scaler.step(optimizer)
+                    # scaler.update()
+                    # flush the gradients as soon as we can, no need for this memory anymore
+                    optimizer.zero_grad(set_to_none=True)
+            
     return loss
 
 
@@ -393,7 +418,7 @@ def measure_training_throughput(batch_size, block_size=128, start_iter=20, max_i
             t0 = time.time()
         loss = train_step(iter_num=iter_num)
         if iter_num == profile_till:
-            profiler.__exit__(None,None,None)
+            profiler.__exit__(None,None,None,None)
         if iter_num % 5 == 0 and ddp_rank == num_gpus-1:
             print(f'Iteration {iter_num}: loss {loss.item() * (gradient_accumulation_steps*batch_size//batch_split_size)}')
         
